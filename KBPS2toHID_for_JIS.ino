@@ -14,8 +14,8 @@
     PS2KeyAdvanced
 
   配線:
-    PS/2 DATA -> Pro Micro D4(4.7k PULLUP to VCC)
-    PS/2 CLK  -> Pro Micro D7(4.7k PULLUP to VCC)
+    PS/2 DATA -> Pro Micro D4
+    PS/2 CLK  -> Pro Micro D7
     PS/2 +5V  -> Pro Micro VCC
     PS/2 GND  -> Pro Micro GND
 
@@ -24,6 +24,8 @@
     - USB側はJIS配列向けのカスタムHIDディスクリプタを使用します。
     - HID Usage 0x87〜0x8Bを通すため、Usage Maximumを0xE7にしています。
     - Keyboard.hは使用しません。
+    - PCから送られるキーボードLED用Output Reportを受信し、
+      CapsLock / NumLock / ScrollLockランプをPS/2キーボード側へ反映します。
 
   JIS固有キー割当:
     PS2Advanced 0x93 -> ￥ / バックスラッシュ -> HID_INT3 0x89
@@ -40,7 +42,7 @@
 
 #include <Arduino.h>
 #include <PS2KeyAdvanced.h>
-#include <HID.h>
+#include <PluggableUSB.h>
 
 // ============================================================
 // ユーザー設定
@@ -192,6 +194,89 @@ PS2KeyAdvanced keyboard;
 #define MOD_RGUI        0x80
 
 // ============================================================
+// USB HID / LED Output Report関連
+// ============================================================
+//
+// USBキーボードのLED状態は、キーボード側が勝手に決めるのではなく、
+// PC側がOutput Reportとしてキーボードへ通知します。
+//
+// LED Output Reportの標準ビット:
+//   bit0 = Num Lock
+//   bit1 = Caps Lock
+//   bit2 = Scroll Lock
+//   bit3 = Compose
+//   bit4 = Kana
+//
+// このスケッチではbit0〜bit2をPS/2キーボードのLEDへ反映します。
+
+#ifndef HID_REPORT_DESCRIPTOR_TYPE
+#define HID_REPORT_DESCRIPTOR_TYPE 0x22
+#endif
+
+#ifndef HID_GET_REPORT
+#define HID_GET_REPORT 0x01
+#endif
+
+#ifndef HID_SET_REPORT
+#define HID_SET_REPORT 0x09
+#endif
+
+#ifndef HID_GET_PROTOCOL
+#define HID_GET_PROTOCOL 0x03
+#endif
+
+#ifndef HID_SET_PROTOCOL
+#define HID_SET_PROTOCOL 0x0B
+#endif
+
+#ifndef HID_GET_IDLE
+#define HID_GET_IDLE 0x02
+#endif
+
+#ifndef HID_SET_IDLE
+#define HID_SET_IDLE 0x0A
+#endif
+
+#ifndef HID_REPORT_TYPE_INPUT
+#define HID_REPORT_TYPE_INPUT 1
+#endif
+
+#ifndef HID_REPORT_TYPE_OUTPUT
+#define HID_REPORT_TYPE_OUTPUT 2
+#endif
+
+#ifndef HID_REPORT_TYPE_FEATURE
+#define HID_REPORT_TYPE_FEATURE 3
+#endif
+
+#ifndef HID_REPORT_PROTOCOL
+#define HID_REPORT_PROTOCOL 1
+#endif
+
+#ifndef HID_BOOT_PROTOCOL
+#define HID_BOOT_PROTOCOL 0
+#endif
+
+// USB側から受け取ったLED状態を保存する変数。
+// USBのsetup処理中に重いPS/2送信を行わないため、ここではフラグだけ立て、
+// loop()側でPS/2キーボードへ反映します。
+volatile uint8_t usbLedReport = 0;
+volatile bool usbLedReportDirty = false;
+
+// 実際にPS/2キーボードへ最後に反映したLED状態。
+// 0xFFで初期化して、起動後の初回同期を必ず行います。
+uint8_t lastAppliedUsbLedReport = 0xFF;
+
+void onUsbLedOutputReport(uint8_t ledByte) {
+  usbLedReport = ledByte;
+  usbLedReportDirty = true;
+}
+
+uint8_t getUsbLedOutputReport() {
+  return usbLedReport;
+}
+
+// ============================================================
 // カスタムHIDディスクリプタ
 // ============================================================
 
@@ -241,13 +326,164 @@ static const uint8_t jisKeyboardReportDescriptor[] PROGMEM = {
   0xC0                           // コレクション終了
 };
 
-class JisHidKeyboard {
+class JisHidKeyboard : public PluggableUSBModule {
 public:
-  JisHidKeyboard() {
-    static HIDSubDescriptor node(jisKeyboardReportDescriptor,
-                                 sizeof(jisKeyboardReportDescriptor));
-    HID().AppendDescriptor(&node);
+  JisHidKeyboard() : PluggableUSBModule(1, 1, epType),
+                     protocol(HID_REPORT_PROTOCOL),
+                     idle(1) {
+    epType[0] = EP_TYPE_INTERRUPT_IN;
+    PluggableUSB().plug(this);
   }
+
+  int getInterface(uint8_t *interfaceCount) {
+    uint8_t interfaceNumber = pluggedInterface;
+    uint8_t endpointNumber = pluggedEndpoint;
+
+    uint8_t descriptor[] = {
+      // Interface Descriptor
+      0x09, 0x04,
+      interfaceNumber,
+      0x00,
+      0x01,        // endpoint数: IN 1本
+      0x03,        // HID
+      0x01,        // Boot Interface Subclass
+      0x01,        // Keyboard
+      0x00,
+
+      // HID Descriptor
+      0x09, 0x21,
+      0x11, 0x01,  // HID 1.11
+      0x00,        // country code
+      0x01,        // descriptor count
+      0x22,        // report descriptor
+      (uint8_t)(sizeof(jisKeyboardReportDescriptor) & 0xFF),
+      (uint8_t)((sizeof(jisKeyboardReportDescriptor) >> 8) & 0xFF),
+
+      // Endpoint Descriptor
+      0x07, 0x05,
+      (uint8_t)(0x80 | endpointNumber),
+      0x03,        // interrupt
+      USB_EP_SIZE, 0x00,
+      0x01         // interval
+    };
+
+    *interfaceCount += 1;
+    return USB_SendControl(0, descriptor, sizeof(descriptor));
+  }
+
+  int getDescriptor(USBSetup &setup) {
+    if (setup.bmRequestType != REQUEST_DEVICETOHOST_STANDARD_INTERFACE) {
+      return 0;
+    }
+
+    if (setup.wValueH != HID_REPORT_DESCRIPTOR_TYPE) {
+      return 0;
+    }
+
+    if (setup.wIndex != pluggedInterface) {
+      return 0;
+    }
+
+    return USB_SendControl(TRANSFER_PGM,
+                           jisKeyboardReportDescriptor,
+                           sizeof(jisKeyboardReportDescriptor));
+  }
+
+  bool setup(USBSetup &setup) {
+    if (setup.wIndex != pluggedInterface) {
+      return false;
+    }
+
+    uint8_t request = setup.bRequest;
+    uint8_t requestType = setup.bmRequestType;
+
+    if (requestType == REQUEST_DEVICETOHOST_CLASS_INTERFACE) {
+      if (request == HID_GET_REPORT) {
+        uint8_t reportType = setup.wValueH;
+        uint8_t reportID = setup.wValueL;
+
+        if (reportType == HID_REPORT_TYPE_OUTPUT &&
+            (reportID == JIS_KBD_REPORT_ID || reportID == 0)) {
+          uint8_t led = getUsbLedOutputReport();
+          USB_SendControl(0, &led, 1);
+          return true;
+        }
+      }
+
+      if (request == HID_GET_PROTOCOL) {
+        USB_SendControl(0, &protocol, 1);
+        return true;
+      }
+
+      if (request == HID_GET_IDLE) {
+        USB_SendControl(0, &idle, 1);
+        return true;
+      }
+    }
+
+    if (requestType == REQUEST_HOSTTODEVICE_CLASS_INTERFACE) {
+      if (request == HID_SET_PROTOCOL) {
+        protocol = setup.wValueL;
+        return true;
+      }
+
+      if (request == HID_SET_IDLE) {
+        idle = setup.wValueL;
+        return true;
+      }
+
+      if (request == HID_SET_REPORT) {
+        uint8_t reportType = setup.wValueH;
+        uint8_t reportID = setup.wValueL;
+
+        if (reportType == HID_REPORT_TYPE_OUTPUT &&
+            (reportID == JIS_KBD_REPORT_ID || reportID == 0)) {
+          uint8_t data[8];
+          uint16_t len = setup.wLength;
+
+          if (len > sizeof(data)) {
+            len = sizeof(data);
+          }
+
+          int received = USB_RecvControl(data, len);
+
+          if (received > 0) {
+            // Report IDがデータ先頭に含まれる環境もあるため両方に対応します。
+            uint8_t led = data[0];
+            if (received >= 2 && data[0] == JIS_KBD_REPORT_ID) {
+              led = data[1];
+            }
+
+            onUsbLedOutputReport(led);
+          }
+
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  int sendReport(const void *data, int len) {
+#if ENABLE_USB_KEYBOARD
+    uint8_t id = JIS_KBD_REPORT_ID;
+    int r = USB_Send(pluggedEndpoint, &id, 1);
+    if (r < 0) return r;
+
+    int r2 = USB_Send(pluggedEndpoint | TRANSFER_RELEASE, data, len);
+    if (r2 < 0) return r2;
+
+    return r + r2;
+#else
+    return 0;
+#endif
+  }
+
+private:
+  uint8_t epType[1];
+  uint8_t protocol;
+  uint8_t idle;
 };
 
 JisHidKeyboard jisHidKeyboardDescriptor;
@@ -296,9 +532,7 @@ void clearReportLocal() {
 }
 
 void sendReportNow() {
-#if ENABLE_USB_KEYBOARD
-  HID().SendReport(JIS_KBD_REPORT_ID, &reportState, sizeof(reportState));
-#endif
+  jisHidKeyboardDescriptor.sendReport(&reportState, sizeof(reportState));
 }
 
 void releaseAllKeys() {
@@ -557,11 +791,68 @@ uint8_t mapPs2AdvancedToHid(uint8_t let) {
 }
 
 // ============================================================
+// PC側LED状態をPS/2キーボードLEDへ同期
+// ============================================================
+
+uint8_t usbLedToPs2Lock(uint8_t ledByte) {
+  uint8_t ps2Lock = 0;
+
+  // USB LED bit0 = Num Lock
+  if (ledByte & 0x01) {
+    ps2Lock |= PS2_LOCK_NUM;
+  }
+
+  // USB LED bit1 = Caps Lock
+  if (ledByte & 0x02) {
+    ps2Lock |= PS2_LOCK_CAPS;
+  }
+
+  // USB LED bit2 = Scroll Lock
+  if (ledByte & 0x04) {
+    ps2Lock |= PS2_LOCK_SCROLL;
+  }
+
+  return ps2Lock;
+}
+
+void syncPs2LedsFromUsbHost() {
+  uint8_t ledByte;
+  bool dirty;
+
+  noInterrupts();
+  ledByte = usbLedReport;
+  dirty = usbLedReportDirty;
+  usbLedReportDirty = false;
+  interrupts();
+
+  // 変化がない場合はPS/2側へ送信しません。
+  if (!dirty && ledByte == lastAppliedUsbLedReport) {
+    return;
+  }
+
+  lastAppliedUsbLedReport = ledByte;
+
+  uint8_t ps2Lock = usbLedToPs2Lock(ledByte);
+  keyboard.setLock(ps2Lock);
+
+#if DEBUG_SERIAL
+  Serial.print("USB_LED=0x");
+  if (ledByte < 0x10) Serial.print('0');
+  Serial.print(ledByte, HEX);
+
+  Serial.print(" -> PS2_LOCK=0x");
+  if (ps2Lock < 0x10) Serial.print('0');
+  Serial.println(ps2Lock, HEX);
+#endif
+}
+
+// ============================================================
 // Lock系キー
 // ============================================================
 
 bool handleLockKey(uint8_t ps2Code, bool make) {
-  // Make時だけトグルし、Breakも消費して処理済みにします。
+  // Make時だけUSBへLockキーを送ります。
+  // 実際のPS/2キーボードLEDは、PCから返ってくるOutput Reportで同期します。
   if (ps2Code == PS2_KEY_NUM) {
     if (make) tapHidUsage(HID_NUMLOCK);
     return true;
@@ -713,6 +1004,7 @@ void setup() {
   Serial.println("DATA = D4");
   Serial.println("CLK  = D7");
   Serial.println("Custom JIS HID descriptor: usages 0x87-0x8B enabled");
+  Serial.println("USB LED Output Report -> PS/2 keyboard LEDs sync enabled");
 #if ENABLE_USB_KEYBOARD
   Serial.println("USB Keyboard = enabled");
 #else
@@ -727,10 +1019,18 @@ void setup() {
   keyboard.begin(DATAPIN, IRQPIN);
   keyboard.setNoRepeat(1);
 
+  // 起動直後は、現在保持しているUSB LED状態をPS/2キーボードへ一度反映します。
+  usbLedReportDirty = true;
+  syncPs2LedsFromUsbHost();
+
   blinkLED(2);
 }
 
 void loop() {
+  // PCからCapsLock/NumLock/ScrollLock状態が通知された場合、
+  // それをPS/2キーボード側のランプへ反映します。
+  syncPs2LedsFromUsbHost();
+
   if (!keyboard.available()) {
     return;
   }
